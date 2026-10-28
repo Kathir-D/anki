@@ -39,25 +39,32 @@ impl Collection {
         new_parent: Option<String>,
     ) -> Result<usize> {
         let usn = self.usn()?;
-        let mut matcher = TagMatcher::new(&join_tags(tags_to_reparent))?;
         let old_to_new_names = old_to_new_names(tags_to_reparent, new_parent);
         if old_to_new_names.is_empty() {
             return Ok(0);
         }
+        // only match tags that will actually move
+        let sources: Vec<_> = tags_to_reparent
+            .iter()
+            .filter(|tag| old_to_new_names.contains_key(&UniCase::new(tag.to_string())))
+            .cloned()
+            .collect();
+        let mut matcher = TagMatcher::new(&join_tags(&sources))?;
         let matched_notes = self
             .storage
             .get_note_tags_by_predicate(|tags| matcher.is_match(tags))?;
         let match_count = matched_notes.len();
-        if match_count == 0 {
-            // no matches; exit early so we don't clobber the empty tag entries
+        let matched_tags = self
+            .storage
+            .get_tags_by_predicate(|tag| matcher.is_match(tag))?;
+        if match_count == 0 && matched_tags.is_empty() {
+            // no notes or registered tags match
             return Ok(0);
         }
 
         // remove old prefixes from the tag list
-        for tag in self
-            .storage
-            .get_tags_by_predicate(|tag| matcher.is_match(tag))?
-        {
+        let old_tag_names: Vec<_> = matched_tags.iter().map(|t| t.name.clone()).collect();
+        for tag in matched_tags {
             self.remove_single_tag_undoable(tag)?;
         }
 
@@ -72,6 +79,16 @@ impl Collection {
             });
             note.set_modified(usn);
             self.update_note_tags_undoable(&note, original)?;
+        }
+
+        // rename the registered tags as well, including ones no note uses
+        for name in old_tag_names {
+            matcher.replace_with_fn(&name, |cap| {
+                old_to_new_names
+                    .get(&UniCase::new(cap.to_string()))
+                    .unwrap()
+                    .clone()
+            });
         }
 
         // update tag list
@@ -138,6 +155,61 @@ mod test {
             .into_iter()
             .map(|t| t.name)
             .collect()
+    }
+
+    /// Registers `used` and `unused` tags, leaving only `used` on a note.
+    fn add_tags(col: &mut Collection, used: &[&str], unused: &[&str]) -> Result<()> {
+        let nt = col.get_notetype_by_name("Basic")?.unwrap();
+        let mut note = nt.new_note();
+        note.tags = used.iter().chain(unused).map(|t| t.to_string()).collect();
+        col.add_note(&mut note, DeckId(1))?;
+        note.tags = used.iter().map(|t| t.to_string()).collect();
+        col.update_note(&mut note)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_tags_moves_unused_subtree() -> Result<()> {
+        let mut col = Collection::new();
+        add_tags(&mut col, &[], &["parent::child", "parent::child::leaf"])?;
+
+        col.reparent_tags(&["parent::child".into()], Some("target".into()))?;
+
+        assert_eq!(alltags(&col), &["target::child", "target::child::leaf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_tags_moves_unused_descendant_when_parent_is_used() -> Result<()> {
+        let mut col = Collection::new();
+        add_tags(&mut col, &["parent::child"], &["parent::child::leaf"])?;
+
+        col.reparent_tags(&["parent::child".into()], Some("target".into()))?;
+
+        assert_eq!(alltags(&col), &["target::child", "target::child::leaf"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_tags_keeps_unused_tag_when_dropped_onto_itself() -> Result<()> {
+        let mut col = Collection::new();
+        add_tags(&mut col, &["b"], &["a"])?;
+
+        col.reparent_tags(&["a".into(), "b".into()], Some("a".into()))?;
+
+        assert_eq!(alltags(&col), &["a", "a::b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reparent_tags_keeps_unused_top_level_tag_when_moved_to_root() -> Result<()> {
+        let mut col = Collection::new();
+        add_tags(&mut col, &["bar::baz"], &["foo"])?;
+
+        col.reparent_tags(&["foo".into(), "bar::baz".into()], None)?;
+
+        assert_eq!(alltags(&col), &["baz", "foo"]);
+        Ok(())
     }
 
     #[test]
